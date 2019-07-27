@@ -25,6 +25,7 @@ use std::cmp::Ordering;
 use std::fmt;
 use std::hash::{Hash, Hasher};
 use std::ptr::copy_nonoverlapping;
+use core::ops::{Add, AddAssign};
 
 use hex_fmt::HexFmt;
 use log::debug;
@@ -91,6 +92,17 @@ impl PartialOrd for PublicKey {
 impl Ord for PublicKey {
     fn cmp(&self, other: &Self) -> Ordering {
         cmp_projective(&self.0, &other.0)
+    }
+}
+
+impl From<Vec<G1>> for PublicKey {
+    fn from(com_vector: Vec<G1>) -> PublicKey {
+        let mut pub_key = com_vector[0];
+        let length = com_vector.len() as usize;
+        for i in 1..length {
+            pub_key.add_assign(&com_vector[i]);
+        }
+        PublicKey(pub_key)
     }
 }
 
@@ -183,6 +195,12 @@ impl PublicKeyShare {
     /// Returns a byte string representation of the public key share.
     pub fn to_bytes(&self) -> [u8; PK_SIZE] {
         self.0.to_bytes()
+    }
+    /// Combines two public key shares to one (basically ads the two commitments)
+    pub fn combine(&self, other: PublicKeyShare) -> PublicKeyShare {
+        let mut commit = self.0.clone().0;
+        commit.add_assign(&other.0.clone().0);
+        PublicKeyShare(PublicKey(commit))
     }
 }
 
@@ -426,6 +444,17 @@ impl fmt::Debug for SecretKeyShare {
     }
 }
 
+impl<'a, 'b> Add<&'b SecretKeyShare> for &'a SecretKeyShare {
+    type Output = SecretKeyShare;
+    fn add(self, other: &'b SecretKeyShare) -> SecretKeyShare {
+        let priv_key_1 = self.clone().0;
+        let priv_key_2 = &other.0;
+        let mut priv_key = *priv_key_1.0;
+        priv_key.add_assign(&(*priv_key_2.0));
+        SecretKeyShare(SecretKey(Box::new(priv_key)))
+    }
+}
+
 impl SecretKeyShare {
     /// Creates a new `SecretKeyShare` from a mutable reference to a field element. This
     /// constructor takes a reference to avoid any unnecessary stack copying/moving of secrets
@@ -472,6 +501,12 @@ impl SecretKeyShare {
     pub fn reveal(&self) -> String {
         let uncomp = self.0.public_key().0.into_affine().into_uncompressed();
         format!("SecretKeyShare({:0.10})", HexFmt(uncomp))
+    }
+
+    /// Commits the key with the generator of G1Affine
+    pub fn commit(&self) -> G1 {
+        let private_key = self.clone().0;
+        G1Affine::one().mul(*private_key.0)
     }
 }
 
@@ -570,6 +605,13 @@ impl PublicKeySet {
     pub fn public_key_share<T: IntoFr>(&self, i: T) -> PublicKeyShare {
         let value = self.commit.evaluate(into_fr_plus_1(i));
         PublicKeyShare(PublicKey(value))
+    }
+
+    /// Combine two PublicKeySet into a single one (used from threshold generation)
+    pub fn combine(&self, other: PublicKeySet) -> PublicKeySet {
+        let mut commit = self.commit.clone();
+        commit.add_assign(&other.commit);
+        PublicKeySet{ commit }
     }
 
     /// Combines the shares into a signature that can be verified with the main public key.
