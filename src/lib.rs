@@ -25,7 +25,7 @@ use std::cmp::Ordering;
 use std::fmt;
 use std::hash::{Hash, Hasher};
 use std::ptr::copy_nonoverlapping;
-use core::ops::{Add, AddAssign};
+use core::ops::{Add, AddAssign, Mul, };
 
 use hex_fmt::HexFmt;
 use log::debug;
@@ -119,6 +119,23 @@ impl PublicKey {
         self.verify_g2(sig, hash_g2(msg))
     }
 
+    /// Encrypt a message such the additive propertiers of ECC is mantained to the
+    /// message. For this to work, the message must be encoded as a point in the 
+    /// curve
+    pub fn hom_encrypt(&self, msg: &G1) -> HomCiphertext {
+        self.hom_encrypt_with_rng(&mut OsRng::new().expect(ERR_OS_RNG), msg)
+    }
+    /// Homomorphically encrypts the message
+    pub fn hom_encrypt_with_rng<R: Rng>(&self, rng: &mut R, msg: &G1) -> HomCiphertext {
+        let r: Fr = rng.gen04();
+        let u = G1Affine::one().mul(r);
+        let v: G1 = {
+            let mut g = self.0.into_affine().mul(r);
+            g.add_assign(&msg);
+            g
+        };
+        HomCiphertext(u, v)
+    }
     /// Encrypts the message using the OS random number generator.
     ///
     /// Uses the `OsRng` by default. To pass in a custom random number generator, use
@@ -402,6 +419,15 @@ impl SecretKey {
         self.sign_g2(hash_g2(msg))
     }
 
+    /// Return the decryption of the homomorphically encrypted text. Attention
+    /// here as we are not verifying the HomCiphertext. 
+    pub fn hom_decrypt(&self, ct: &HomCiphertext) -> G1 {
+        let HomCiphertext(ref u, ref v) = *ct;
+        let mut g = v.clone();
+        g.sub_assign(&u.into_affine().mul(*self.0));
+        g
+    }
+
     /// Returns the decrypted text, or `None`, if the ciphertext isn't valid.
     pub fn decrypt(&self, ct: &Ciphertext) -> Option<Vec<u8>> {
         if !ct.verify() {
@@ -495,6 +521,11 @@ impl SecretKeyShare {
         DecryptionShare(ct.0.into_affine().mul(*(self.0).0))
     }
 
+    /// Returns a decryption share, without validating the homomorphic ciphertext.
+    pub fn hom_decrypt_share_no_verify(&self, ct: &HomCiphertext) -> DecryptionShare {
+        DecryptionShare(ct.0.into_affine().mul(*(self.0).0))
+    }
+
     /// Generates a non-redacted debug string. This method differs from
     /// the `Debug` implementation in that it *does* leak the secret prime
     /// field element.
@@ -509,6 +540,69 @@ impl SecretKeyShare {
         G1Affine::one().mul(*private_key.0)
     }
 }
+
+/// A homomorphically encrypted message in G1
+#[derive(Deserialize, Serialize, Debug, Copy, Clone, PartialEq, Eq)]
+pub struct HomCiphertext(
+    #[serde(with = "serde_impl::projective")] G1,
+    #[serde(with = "serde_impl::projective")] G1,
+);
+
+impl Hash for HomCiphertext {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        let HomCiphertext(ref u, ref v) = *self;
+        u.into_affine().into_compressed().as_ref().hash(state);
+        v.into_affine().into_compressed().as_ref().hash(state);
+    }
+}
+
+impl PartialOrd for HomCiphertext {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(&other))
+    }
+}
+
+impl Ord for HomCiphertext {
+    fn cmp(&self, other: &Self) -> Ordering {
+        let HomCiphertext(ref u0, ref v0) = self;
+        let HomCiphertext(ref u1, ref v1) = other;
+        cmp_projective(u0, u1)
+            .then(cmp_projective(v0, v1))
+    }
+}
+
+impl <'a, 'b> Add<&'b HomCiphertext> for &'a HomCiphertext {
+    type Output = HomCiphertext;
+
+    fn add(self, other: &'b HomCiphertext) -> HomCiphertext {
+        let mut point1 = G1::zero();
+        let mut point2 = G1::zero();
+        point1.add_assign(&self.0);
+        point1.add_assign(&other.0);
+        point2.add_assign(&self.1);
+        point2.add_assign(&other.1);
+        HomCiphertext(point1, point2)
+    }
+}
+
+impl <'a, 'b> Mul<&'b Fr> for &'a HomCiphertext {
+    type Output = HomCiphertext;
+
+    fn mul(self, other: &'b Fr) -> HomCiphertext {
+        HomCiphertext(self.0.into_affine().mul(*other), self.1.into_affine().mul(*other))
+    }
+}
+
+// Attention to chosen plaintext attacks.. see whether we are exposed to that. 
+// impl HomCiphertext {
+//     /// Returns `true` if this is a valid ciphertext. This check is necessary to prevent
+//     /// chosen-ciphertext attacks.
+//     pub fn verify(&self) -> bool {
+//         let HomCiphertext(ref u, ref v) = *self;
+//         let hash = hash_g1_g2(*u, v);
+//         PEngine::pairing(G1Affine::one(), *w) == PEngine::pairing(*u, hash)
+//     }
+// }
 
 /// An encrypted message.
 #[derive(Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
@@ -654,6 +748,19 @@ impl PublicKeySet {
     {
         let samples = shares.into_iter().map(|(i, share)| (i, &(share.0).0));
         Ok(Signature(interpolate(self.commit.degree(), samples)?))
+    }
+
+    /// Combines the shares to homomorphically decrypt the ciphertext.
+    pub fn hom_decrypt<'a, T, I>(&self, shares: I, ct: &HomCiphertext) -> Result<G1>
+    where 
+        I: IntoIterator<Item = (T, &'a DecryptionShare)>, 
+        T: IntoFr, 
+    {
+        let samples = shares.into_iter().map(|(i, share)| (i, &share.0));
+        let mut g = ct.1;
+        let decryption_point = interpolate(self.commit.degree(), samples)?;
+        g.sub_assign(&decryption_point);
+        Ok(g)
     }
 
     /// Combines the shares to decrypt the ciphertext.
@@ -928,6 +1035,40 @@ mod tests {
         let fake_ciphertext = Ciphertext(u, vec![0; v.len()], w);
         assert!(!fake_ciphertext.verify());
         assert_eq!(None, sk_bob.decrypt(&fake_ciphertext));
+    }
+    #[test]
+    fn test_hom_enc() {
+        let sk_bob: SecretKey = random();
+        let sk_eve: SecretKey = random();
+        let pk_bob = sk_bob.public_key();
+        let msg = G1::one();
+        let one = Fr::one();
+        let mut value = one.clone();
+
+
+        let ciphertext = pk_bob.hom_encrypt(&msg);
+
+        // Bob can decrypt the message.
+        let decrypted = sk_bob.hom_decrypt(&ciphertext);
+        assert_eq!(msg, decrypted);
+
+        // Eve can't
+        let decrypted_eve = sk_eve.hom_decrypt(&ciphertext);
+        assert_ne!(msg, decrypted_eve);
+
+        // Addition of ciphertexts results in the addition of plaintexts
+        value.add_assign(&one); // wtf is this?? I cant simply add two numbers?! Shitty Fr
+        let two = value.clone();
+        let msg_times_two = msg.into_affine().mul(two);
+
+        let added_ciphertext = &ciphertext + &ciphertext;
+        let decrypted_added = sk_bob.hom_decrypt(&added_ciphertext);
+        assert_eq!(msg_times_two, decrypted_added);
+
+        // Now we verify that multiplication by scalars is also preserved
+        let ctx_times_two = &ciphertext * &two;
+        assert_eq!(msg_times_two, sk_bob.hom_decrypt(&ctx_times_two));
+
     }
 
     #[test]

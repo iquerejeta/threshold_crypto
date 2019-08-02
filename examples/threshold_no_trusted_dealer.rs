@@ -14,9 +14,10 @@ use std::collections::BTreeMap;
 use std::time::Instant;
 
 use threshold_crypto::{
-    Ciphertext, DecryptionShare, PublicKeySet, PublicKeyShare, SecretKeySet,
-    SecretKeyShare, G1,
+    HomCiphertext, DecryptionShare, PublicKeySet, PublicKeyShare, SecretKeySet,
+    SecretKeyShare, G1, G1Affine, FrRepr, 
 };
+use pairing::{CurveAffine};
 
 #[derive(Clone, Debug)]
 struct UntrustedSociety {
@@ -94,7 +95,7 @@ struct Actor {
     sk_2: SecretKeyShare, // Don't really see why this is here
     pk_1: PublicKeyShare,
     com_sk_1: G1,
-    msg_inbox: Option<Ciphertext>,
+    msg_inbox: Option<HomCiphertext>,
 }
 
 impl Actor{
@@ -148,7 +149,7 @@ impl PartialActor {
 }
 
 // Sends an encrypted message to an `Actor`.
-fn send_msg(actor: &mut Actor, enc_msg: Ciphertext) {
+fn send_msg(actor: &mut Actor, enc_msg: HomCiphertext) {
     actor.msg_inbox = Some(enc_msg);
 }
 
@@ -156,7 +157,7 @@ fn send_msg(actor: &mut Actor, enc_msg: Ciphertext) {
 // ciphertext.
 struct DecryptionMeeting {
     pk_set: PublicKeySet,
-    ciphertext: Option<Ciphertext>,
+    ciphertext: Option<HomCiphertext>,
     dec_shares: BTreeMap<usize, DecryptionShare>,
 }
 
@@ -175,19 +176,19 @@ impl DecryptionMeeting {
             self.ciphertext = Some(ciphertext.clone());
         }
 
-        let dec_share = actor.sk_1.decrypt_share(&ciphertext).unwrap();
-        let dec_share_is_valid = actor
-            .pk_1
-            .verify_decryption_share(&dec_share, &ciphertext);
-        assert!(dec_share_is_valid);
+        let dec_share = actor.sk_1.hom_decrypt_share_no_verify(&ciphertext);
+        // let dec_share_is_valid = actor
+        //     .pk_1
+        //     .verify_decryption_share(&dec_share, &ciphertext);
+        // assert!(dec_share_is_valid);
         self.dec_shares.insert(actor.id, dec_share);
     }
 
     // Tries to decrypt the shared ciphertext using the decryption shares.
-    fn decrypt_message(&self) -> Result<Vec<u8>, ()> {
+    fn hom_decrypt_message(&self) -> Result<G1, ()> {
         let ciphertext = self.ciphertext.clone().unwrap();
         self.pk_set
-            .decrypt(&self.dec_shares, &ciphertext)
+            .hom_decrypt(&self.dec_shares, &ciphertext)
             .map_err(|_| ())
     }
 }
@@ -207,9 +208,9 @@ impl CheatingLogs {
 fn main() {
     // We will give an example were we have three trustees, where the treshold is one (this is, at least two entities must collaborate). 
     // Hence, we initiate three tellers.
-    let nmbr_users = 50;
+    let nmbr_users = 13;
     let nmbr_users_128 = nmbr_users.clone() as u128;
-    let threshold = 40;
+    let threshold = 8;
     let mut tellers: Vec<Teller> = Vec::new();
     let mut master_pk_set: Vec<&PublicKeySet> = Vec::new();
     let mut now = Instant::now();
@@ -243,8 +244,9 @@ fn main() {
     let master_pub_key = society.clone().pk_set;
 
     // We encrypt the plaintext
-    let msg = b"let's get pizza";
-    let ciphertext = master_pub_key.public_key().encrypt(msg);
+    let msg = FrRepr::from(17);
+    let encoded_msg = G1Affine::one().mul(msg);
+    let ciphertext = master_pub_key.public_key().hom_encrypt(&encoded_msg);
 
     // We send the messages to each of the actors
     for i in 0..nmbr_users {
@@ -258,14 +260,14 @@ fn main() {
     now = Instant::now();
     for i in 0..threshold {
         meeting.accept_decryption_share(society.get_actor(i));
-        assert!(meeting.decrypt_message().is_err());
+        assert!(meeting.hom_decrypt_message().is_err());
     }
     // Then, we will get successful decryptions
     for i in 0..(nmbr_users - threshold) {
         meeting.accept_decryption_share(society.get_actor(threshold + i));
-        let res = meeting.decrypt_message();
+        let res = meeting.hom_decrypt_message();
         assert!(res.is_ok());
-        assert_eq!(msg, res.unwrap().as_slice());
+        assert_eq!(encoded_msg, res.unwrap());
     }
     let time_decryption = now.elapsed().as_millis() / &nmbr_users_128;
 
